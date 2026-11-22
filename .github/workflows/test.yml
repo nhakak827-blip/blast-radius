@@ -22,6 +22,26 @@ jobs:
         with:
           python-version: '3.13'
 
+      - name: Arrange uploaded sample files
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import shutil
+          sample = Path('sample')
+          commits = sample / 'commits'
+          commits.mkdir(parents=True, exist_ok=True)
+          for name in ('tests.json', 'answers.json'):
+              destination = sample / name
+              if not destination.is_file():
+                  shutil.copyfile(name, destination)
+          if not any(commits.glob('*.patch')):
+              for patch in Path('.').glob('*.patch'):
+                  shutil.copyfile(patch, commits / patch.name)
+          if not any(commits.glob('*.patch')):
+              raise SystemExit('Sample commit patches are missing')
+          print(f'Sample ready with {len(list(commits.glob("*.patch")))} commits')
+          PY
+
       - name: Build the submission within ten minutes
         timeout-minutes: 10
         run: docker build --platform linux/amd64 --tag blast-radius-entry . 2>&1 | tee build.log
