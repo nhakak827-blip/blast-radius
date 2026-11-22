@@ -9,6 +9,7 @@ COPY requirements.lock /build/requirements.lock
 RUN pip install --no-cache-dir -r /build/requirements.lock
 COPY --from=upstream /sqlglot/sqlglot /sqlglot/sqlglot
 COPY --from=upstream /sqlglot/tests /sqlglot/tests
+COPY --from=upstream /sqlglot/sqlglotc /sqlglot/sqlglotc
 COPY --from=upstream /sqlglot/pyproject.toml /sqlglot/pyproject.toml
 ENV PYTHONDONTWRITEBYTECODE=1 SKIP_INTEGRATION=0 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
 RUN python -m compileall -q /sqlglot

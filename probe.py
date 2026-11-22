@@ -12,7 +12,7 @@ import time
 from comparisons import identical
 
 
-def patch_loaded_functions(root, sources):
+def patch_loaded_functions(root, sources, collected_calls=None):
     """Preserve all existing aliases when replacing an ordinary function body."""
     changes = []
     for path, source in sources.items():
@@ -40,6 +40,10 @@ def patch_loaded_functions(root, sources):
                 if any(not identical(getattr(before, name, None), getattr(after, name, None))
                        for name in before._fields if name != 'body'):
                     return False
+                if any(not isinstance(decorator, ast.Name)
+                       or decorator.id not in {'staticmethod', 'classmethod', 'property'}
+                       for decorator in before.decorator_list):
+                    return False
                 target = vars(owner).get(before.name)
                 if isinstance(target, (classmethod, staticmethod)):
                     target = target.__func__
@@ -54,6 +58,8 @@ def patch_loaded_functions(root, sources):
                         or target.__code__.co_qualname != name
                         or Path(target.__code__.co_filename).resolve() != (root / path).resolve()
                         or target.__code__.co_freevars != code.co_freevars):
+                    return False
+                if collected_calls is not None and id(target.__code__) in collected_calls:
                     return False
                 changes.append((target, code))
                 return True
@@ -86,7 +92,7 @@ def clear_checkout_modules(root):
             del sys.modules[name]
 
 
-def run(checkout, request, warmed=False):
+def run(checkout, request, warmed=False, collected_calls=None):
     import pytest
     from inline_pool import install
 
@@ -98,7 +104,7 @@ def run(checkout, request, warmed=False):
     os.environ["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
 
     edits = {str(root / path): source for path, source in request["sources"].items()}
-    if warmed and not patch_loaded_functions(root, request['sources']):
+    if warmed and not patch_loaded_functions(root, request['sources'], collected_calls):
         clear_checkout_modules(root)
     get_code = importlib.machinery.SourceFileLoader.get_code
 
@@ -134,11 +140,11 @@ def run(checkout, request, warmed=False):
     return sorted(reports.completed - reports.failed)
 
 
-def batch_child(checkout, request, connection, warmed):
+def batch_child(checkout, request, connection, warmed, collected_calls):
     """Keep each patch's imports, globals and pytest state inside its own process."""
     sys.stdout = sys.stderr
     try:
-        passing = run(checkout, {**request, 'stop_on_failure': True}, warmed)
+        passing = run(checkout, {**request, 'stop_on_failure': True}, warmed, collected_calls)
         connection.send({"passing": passing, "cpu_seconds": time.process_time()})
     finally:
         connection.close()
@@ -156,6 +162,7 @@ def run_batch(checkout, requests):
 
     install()
     warmed = hasattr(os, 'fork')
+    collected_calls = set()
     if warmed:
         os.environ['SKIP_INTEGRATION'] = '0'
         os.environ['PYTEST_DISABLE_PLUGIN_AUTOLOAD'] = '1'
@@ -165,8 +172,19 @@ def run_batch(checkout, requests):
         # Collection imports the clean modules without executing any test bodies.
         targets = ['tests'] if (root / 'tests').is_dir() else list(dict.fromkeys(
             nodeid for request in requests for nodeid in request['ids']))
-        status = pytest.main(['--collect-only', '-q', '-p', 'no:cacheprovider',
-                              '-p', 'no:assertion', *targets])
+        prefix = str(root) + os.sep
+
+        def observe_calls(frame, event, argument):
+            if event == 'call' and frame.f_code.co_filename.startswith(prefix):
+                collected_calls.add(id(frame.f_code))
+
+        previous_profile = sys.getprofile()
+        sys.setprofile(observe_calls)
+        try:
+            status = pytest.main(['--collect-only', '-q', '-p', 'no:cacheprovider',
+                                  '-p', 'no:assertion', *targets])
+        finally:
+            sys.setprofile(previous_profile)
         if status != pytest.ExitCode.OK:
             clear_checkout_modules(root)
             warmed = False
@@ -183,7 +201,8 @@ def run_batch(checkout, requests):
             timings.append(None)
             continue
         receiver, sender = context.Pipe(duplex=False)
-        process = context.Process(target=batch_child, args=(checkout, request, sender, warmed))
+        process = context.Process(target=batch_child,
+                                  args=(checkout, request, sender, warmed, collected_calls))
         try:
             process.start()
             sender.close()

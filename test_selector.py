@@ -132,6 +132,20 @@ class ImpactTests(unittest.TestCase):
 
 
 class LoadedFunctionTests(unittest.TestCase):
+    def test_cached_decorators_require_fresh_imports(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            source = 'from functools import lru_cache\n@lru_cache(None)\ndef value():\n    return 1\n'
+            (root / 'cached_patch_fixture.py').write_text(source, encoding='utf-8')
+            module = types.ModuleType('cached_patch_fixture')
+            exec(compile(source, str(root / 'cached_patch_fixture.py'), 'exec'), module.__dict__)
+            sys.modules[module.__name__] = module
+            self.addCleanup(sys.modules.pop, module.__name__, None)
+            self.assertEqual(module.value(), 1)
+            self.assertFalse(patch_loaded_functions(root, {'cached_patch_fixture.py':
+                source.replace('return 1', 'return 2')}))
+            self.assertEqual(module.value(), 1)
+
     def test_aliases_observe_body_changes_and_signature_changes_fall_back(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -144,6 +158,9 @@ class LoadedFunctionTests(unittest.TestCase):
             alias = module.value
             self.assertTrue(patch_loaded_functions(root, {'hot_patch_fixture.py':
                 'def value():\n    return 2\n'}))
+            self.assertEqual(alias(), 2)
+            self.assertFalse(patch_loaded_functions(root, {'hot_patch_fixture.py':
+                'def value():\n    return 3\n'}, {id(alias.__code__)}))
             self.assertEqual(alias(), 2)
             self.assertFalse(patch_loaded_functions(root, {'hot_patch_fixture.py':
                 'def value(argument=3):\n    return argument\n'}))
