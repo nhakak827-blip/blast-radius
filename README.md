@@ -68,6 +68,8 @@ The verified mode matched the 94.351 s reference obtained by scheduling only the
 
 `make sample` prints your simulated seconds and misses, which are exact for that output. The board adds the CPU seconds your container used and takes the middle of 3 runs, so expect it a little higher. Your program never sees `sample/answers.json`: only the patches and `tests.json` are mounted.
 
+You can also test from your GitHub repository. Commit `.github/workflows/test.yml` to the default branch, open **Actions**, select **Test Blast Radius**, and choose **Run workflow**. The workflow builds the Linux image with a ten-minute deadline, runs the synthetic tests inside it, and benchmarks three runs of each mode under the runtime restrictions. It checks for zero sample misses and a verified median total below 101.9 seconds. Logs and selected test lists are saved as workflow artifacts. GitHub runner hardware can produce different CPU timings from the competition server.
+
 `sample/answers.json` lists the tests each sample commit breaks and the kind of change it is. The practice and final commits are hidden, and so is everything your program prints when it runs on them. A rejected submission tells you which rule it broke and nothing more, so reproduce problems here.
 
 ## Submit
