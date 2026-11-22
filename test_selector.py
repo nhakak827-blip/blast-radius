@@ -1,6 +1,8 @@
 """Synthetic regression checks for patch interpretation and selection."""
 import importlib.util
 import ast
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 import tempfile
 import unittest
@@ -8,7 +10,7 @@ import sys
 import types
 
 from selector import Impact, apply_hunks, optimized_workers, parse_patch, probe, probe_batch
-from probe import patch_loaded_functions
+from probe import patch_loaded_functions, collect_for_probes, run_collected_unittest
 
 
 class PatchTests(unittest.TestCase):
@@ -132,6 +134,20 @@ class ImpactTests(unittest.TestCase):
 
 
 class LoadedFunctionTests(unittest.TestCase):
+    def test_pending_generators_require_fresh_imports(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            source = 'def values():\n    yield 1\n'
+            (root / 'generator_patch_fixture.py').write_text(source, encoding='utf-8')
+            module = types.ModuleType('generator_patch_fixture')
+            exec(compile(source, str(root / 'generator_patch_fixture.py'), 'exec'), module.__dict__)
+            sys.modules[module.__name__] = module
+            self.addCleanup(sys.modules.pop, module.__name__, None)
+            pending = module.values()
+            self.assertFalse(patch_loaded_functions(root, {'generator_patch_fixture.py':
+                source.replace('yield 1', 'yield 2')}))
+            self.assertEqual(next(pending), 1)
+
     def test_cached_decorators_require_fresh_imports(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -179,6 +195,59 @@ class SchedulerTests(unittest.TestCase):
 
 @unittest.skipUnless(importlib.util.find_spec("pytest_timeout"), "locked pytest tools required")
 class ProbeTests(unittest.TestCase):
+    def test_collected_unittest_preserves_subtests_skips_and_class_cleanup(self):
+        name = 'collected_unittest_fixture'
+        module = types.ModuleType(name)
+        exec('import unittest\n'
+             'events = []\n'
+             'class Cases(unittest.TestCase):\n'
+             '    @classmethod\n'
+             '    def setUpClass(cls):\n'
+             '        events.append("setup")\n'
+             '        cls.addClassCleanup(events.append, "cleanup")\n'
+             '    def tearDown(self):\n'
+             '        events.append("teardown")\n'
+             '    def test_fail(self):\n'
+             '        with self.subTest("broken"):\n'
+             '            self.assertEqual(1, 2)\n'
+             '    def test_skip(self):\n'
+             '        with self.subTest("skipped"):\n'
+             '            self.skipTest("keep candidate")\n'
+             '    def test_pass(self):\n'
+             '        self.assertTrue(True)\n', module.__dict__)
+        sys.modules[name] = module
+        self.addCleanup(sys.modules.pop, name, None)
+        ids = [f'{name}.py::Cases::test_{case}' for case in ('fail', 'skip', 'pass')]
+        self.assertEqual(run_collected_unittest({'ids': ids}), [ids[-1]])
+        self.assertEqual(module.events, ['setup', 'teardown', 'teardown', 'teardown', 'cleanup'])
+        module.events.clear()
+        self.assertEqual(run_collected_unittest({'ids': ids, 'stop_on_failure': True}), [])
+        self.assertEqual(module.events, ['setup', 'teardown', 'cleanup'])
+        def broken_cleanup():
+            raise RuntimeError('class cleanup failed')
+        module.Cases.tearDownClass = staticmethod(broken_cleanup)
+        self.assertEqual(run_collected_unittest({'ids': [ids[-1]]}), [])
+        del module.Cases.tearDownClass
+        module.Cases.pytestmark = ['custom fixture semantics']
+        self.assertIsNone(run_collected_unittest({'ids': ids}))
+
+    def test_collection_records_import_calls_and_releases_monitoring(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            filename = root / 'test_collect_probe_fixture.py'
+            filename.write_text('def initialize():\n    return 1\nvalue = initialize()\n'
+                                'def test_value():\n    assert value == 1\n', encoding='utf-8')
+            monitoring = getattr(sys, 'monitoring', None)
+            before = [monitoring.get_tool(tool) for tool in (3, 4, 5)] if monitoring else None
+            with redirect_stdout(StringIO()):
+                status, calls = collect_for_probes(root, [str(filename)])
+            self.assertEqual(status, 0)
+            module = sys.modules['test_collect_probe_fixture']
+            self.addCleanup(sys.modules.pop, 'test_collect_probe_fixture', None)
+            self.assertIn(id(module.initialize.__code__), calls)
+            if monitoring:
+                self.assertEqual([monitoring.get_tool(tool) for tool in (3, 4, 5)], before)
+
     def test_subtest_failure_and_ordinary_pass(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -202,9 +271,12 @@ class ProbeTests(unittest.TestCase):
                     {"ids": [test["id"] for test in reversed(tests)], "sources": {"example.py": "value = 2\n"}},
                     {"ids": [test["id"] for test in tests], "sources": {"example.py": "value = 1\n"}},
                     {"ids": [test["id"] for test in tests], "sources": {"example.py": "value = 2\n"}},
+                    {"ids": [test["id"] for test in tests], "sources": {"example.py": "value = 2\n"},
+                     'milliseconds': 100},
                 ])
                 self.assertEqual(results, [{"test_example.py::Cases::test_passes"},
-                                           {"test_example.py::Cases::test_subtest"}, set()])
+                                           {"test_example.py::Cases::test_subtest"}, set(),
+                                           {"test_example.py::Cases::test_passes"}])
 
 
 if __name__ == "__main__":

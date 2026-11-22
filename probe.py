@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import sys
 import time
+import unittest
 
 from comparisons import identical
 
@@ -57,7 +58,9 @@ def patch_loaded_functions(root, sources, collected_calls=None):
                 if (not inspect.isfunction(target) or code is None
                         or target.__code__.co_qualname != name
                         or Path(target.__code__.co_filename).resolve() != (root / path).resolve()
-                        or target.__code__.co_freevars != code.co_freevars):
+                        or target.__code__.co_freevars != code.co_freevars
+                        or (target.__code__.co_flags | code.co_flags) & (
+                            inspect.CO_GENERATOR | inspect.CO_COROUTINE | inspect.CO_ASYNC_GENERATOR)):
                     return False
                 if collected_calls is not None and id(target.__code__) in collected_calls:
                     return False
@@ -90,6 +93,58 @@ def clear_checkout_modules(root):
         filename = getattr(module, '__file__', None)
         if filename and Path(filename).resolve().is_relative_to(root):
             del sys.modules[name]
+
+
+def run_collected_unittest(request):
+    """Use unittest's own lifecycle for already imported, fixture-free cases."""
+    cases = []
+    names = {}
+    for nodeid in request['ids']:
+        parts = nodeid.split('::')
+        if len(parts) != 3:
+            return None
+        filename, class_name, method = parts
+        module = sys.modules.get(filename.removesuffix('.py').replace('/', '.'))
+        klass = vars(module).get(class_name) if module else None
+        if not isinstance(klass, type) or not issubclass(klass, unittest.TestCase):
+            return None
+        scopes = [module, *klass.__mro__, getattr(klass, method, None)]
+        if any(getattr(scope, 'pytestmark', None) for scope in scopes):
+            return None
+        if any(hasattr(value, '_pytestfixturefunction') or hasattr(value, '_fixture_function')
+               for scope in [module, *klass.__mro__] for value in vars(scope).values()):
+            return None
+        case = klass(method)
+        cases.append(case)
+        names[id(case)] = nodeid
+
+    class Reports(unittest.TestResult):
+        def __init__(self):
+            super().__init__()
+            self.passing = set()
+            self.blocked = set()
+            self.fixture_error = False
+            self.failfast = bool(request.get('stop_on_failure'))
+
+        def addSuccess(self, test):
+            super().addSuccess(test)
+            self.passing.add(names[id(test)])
+
+        def addSkip(self, test, reason):
+            super().addSkip(test, reason)
+            parent = getattr(test, 'test_case', test)
+            self.blocked.add(names.get(id(parent)))
+
+        def addError(self, test, error):
+            super().addError(test, error)
+            if id(test) not in names:
+                self.fixture_error = True
+
+    reports = Reports()
+    unittest.TestSuite(cases).run(reports)
+    if reports.fixture_error:
+        return []
+    return sorted(reports.passing - reports.blocked)
 
 
 def run(checkout, request, warmed=False, collected_calls=None):
@@ -128,6 +183,10 @@ def run(checkout, request, warmed=False, collected_calls=None):
     reports = Reports()
     importlib.machinery.SourceFileLoader.get_code = patched_code
     try:
+        if warmed:
+            passing = run_collected_unittest(request)
+            if passing is not None:
+                return passing
         status = pytest.main(
             ["-q", "--tb=no", "-p", "no:cacheprovider", "-p", "no:assertion", "-p", "pytest_timeout",
              "--timeout=4", *(['-x'] if request.get('stop_on_failure') else []), *request["ids"]],
@@ -144,10 +203,49 @@ def batch_child(checkout, request, connection, warmed, collected_calls):
     """Keep each patch's imports, globals and pytest state inside its own process."""
     sys.stdout = sys.stderr
     try:
-        passing = run(checkout, {**request, 'stop_on_failure': True}, warmed, collected_calls)
+        stop_on_failure = request.get('milliseconds', 1000) > 300
+        passing = run(checkout, {**request, 'stop_on_failure': stop_on_failure}, warmed, collected_calls)
         connection.send({"passing": passing, "cpu_seconds": time.process_time()})
     finally:
         connection.close()
+
+
+def collect_for_probes(root, targets):
+    """Record import-time function calls once per code location."""
+    import pytest
+    calls = set()
+    prefix = str(root) + os.sep
+    options = ['--collect-only', '-q', '-p', 'no:cacheprovider', '-p', 'no:assertion', *targets]
+    monitoring = getattr(sys, 'monitoring', None)
+    identifier = (next((tool for tool in (3, 4, 5) if monitoring.get_tool(tool) is None), None)
+                  if monitoring is not None else None)
+    if identifier is not None:
+        def observe_start(code, instruction_offset):
+            if code.co_filename.startswith(prefix):
+                calls.add(id(code))
+            return monitoring.DISABLE
+
+        monitoring.use_tool_id(identifier, 'blast-radius-imports')
+        monitoring.register_callback(identifier, monitoring.events.PY_START, observe_start)
+        monitoring.set_events(identifier, monitoring.events.PY_START)
+        try:
+            status = pytest.main(options)
+        finally:
+            monitoring.set_events(identifier, 0)
+            monitoring.register_callback(identifier, monitoring.events.PY_START, None)
+            monitoring.free_tool_id(identifier)
+    else:
+        def observe_calls(frame, event, argument):
+            if event == 'call' and frame.f_code.co_filename.startswith(prefix):
+                calls.add(id(frame.f_code))
+
+        previous_profile = sys.getprofile()
+        sys.setprofile(observe_calls)
+        try:
+            status = pytest.main(options)
+        finally:
+            sys.setprofile(previous_profile)
+    return status, calls
 
 
 def run_batch(checkout, requests):
@@ -170,21 +268,9 @@ def run_batch(checkout, requests):
         os.chdir(root)
         sys.path.insert(0, str(root))
         # Collection imports the clean modules without executing any test bodies.
-        targets = ['tests'] if (root / 'tests').is_dir() else list(dict.fromkeys(
-            nodeid for request in requests for nodeid in request['ids']))
-        prefix = str(root) + os.sep
-
-        def observe_calls(frame, event, argument):
-            if event == 'call' and frame.f_code.co_filename.startswith(prefix):
-                collected_calls.add(id(frame.f_code))
-
-        previous_profile = sys.getprofile()
-        sys.setprofile(observe_calls)
-        try:
-            status = pytest.main(['--collect-only', '-q', '-p', 'no:cacheprovider',
-                                  '-p', 'no:assertion', *targets])
-        finally:
-            sys.setprofile(previous_profile)
+        targets = list(dict.fromkeys(nodeid.split('::', 1)[0]
+                                     for request in requests for nodeid in request['ids']))
+        status, collected_calls = collect_for_probes(root, targets)
         if status != pytest.ExitCode.OK:
             clear_checkout_modules(root)
             warmed = False

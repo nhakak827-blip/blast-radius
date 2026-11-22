@@ -482,7 +482,8 @@ def main():
                 and probe_ms <= args.probe_budget_ms):
             request_index = len(requests)
             ordered = sorted(probeable, key=lambda test: (durations[test['number']], test['number']))
-            requests.append({"ids": [test["id"] for test in ordered], "sources": sources})
+            requests.append({"ids": [test["id"] for test in ordered], "sources": sources,
+                             'milliseconds': probe_ms})
         rows.append((patch.stem, selected, request_index))
     results, cpu = probe_batch(args.checkout, requests, args.report_cpu) if requests else ([], 0.0)
     for commit, selected, request_index in rows:
