@@ -1,0 +1,83 @@
+name: Test Blast Radius
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  competition-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Download repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Build the submission within ten minutes
+        timeout-minutes: 10
+        run: docker build --platform linux/amd64 --tag blast-radius-entry . 2>&1 | tee build.log
+
+      - name: Run all synthetic tests in the submission image
+        timeout-minutes: 2
+        run: |
+          docker run --rm --platform linux/amd64 --network none --cpus 2 \
+            --memory 4096m --memory-swap 4096m --pids-limit 256 --read-only \
+            --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL \
+            --security-opt no-new-privileges --user 65534:65534 --env HOME=/tmp \
+            --mount "type=bind,source=$PWD,target=/checks,readonly" \
+            --workdir /checks --entrypoint python blast-radius-entry \
+            -m unittest -v test_selector 2>&1 | tee synthetic-tests.log
+
+      - name: Benchmark three runs of each selection mode
+        timeout-minutes: 20
+        run: python benchmark.py --image blast-radius-entry --runs 3 2>&1 | tee benchmark.log
+
+      - name: Check zero misses and the score target
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          text = Path('benchmark.log').read_text()
+          for mode in ('coverage', 'verified'):
+              runs = re.findall(rf'^{mode} run \d+:.*$', text, re.MULTILINE)
+              if len(runs) != 3 or any('misses=[]' not in run for run in runs):
+                  raise SystemExit(f'{mode} requires three valid runs with zero misses')
+          match = re.search(r'^verified median total: ([\d.]+)s', text, re.MULTILINE)
+          if match is None:
+              raise SystemExit('The Linux CPU measurement is missing')
+          total = float(match[1])
+          if total >= 101.9:
+              raise SystemExit(f'Target missed: {total:.6f} seconds, target below 101.9')
+          print(f'Target passed: {total:.6f} seconds with zero sample misses')
+          PY
+
+      - name: Show benchmark results
+        if: always()
+        run: |
+          if [ -f benchmark.log ]; then
+            echo '```text' >> "$GITHUB_STEP_SUMMARY"
+            cat benchmark.log >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Save logs and selected tests
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: blast-radius-test-results
+          path: |
+            build.log
+            synthetic-tests.log
+            benchmark.log
+            coverage.jsonl
+            verified.jsonl
+          if-no-files-found: warn
