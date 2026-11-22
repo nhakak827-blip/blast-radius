@@ -1,6 +1,8 @@
 """Benchmark the starter, coverage-only selection, and bounded verification."""
 import argparse
+from decimal import Decimal, ROUND_HALF_UP
 import json
+import os
 from pathlib import Path
 import re
 import statistics
@@ -30,6 +32,7 @@ def main():
     parser.add_argument("--index", type=Path, default=Path("impact.json.gz"))
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--coverage-only", action="store_true")
+    parser.add_argument("--target-seconds", type=Decimal, default=Decimal('100.0'))
     args = parser.parse_args()
     root = Path(__file__).resolve().parent
     sample = root / "sample"
@@ -45,6 +48,23 @@ def main():
           flush=True)
 
     if args.image:
+        # Measure after selector shutdown so its interpreter cleanup is included.
+        container_runner = """
+import pathlib
+import resource
+import subprocess
+import sys
+result = subprocess.run([sys.executable, '/app/selector.py', *sys.argv[1:]])
+try:
+    stats = dict(line.split() for line in pathlib.Path('/sys/fs/cgroup/cpu.stat').read_text().splitlines())
+    cpu = int(stats['usage_usec']) / 1_000_000
+except (OSError, KeyError, ValueError):
+    own = resource.getrusage(resource.RUSAGE_SELF)
+    child = resource.getrusage(resource.RUSAGE_CHILDREN)
+    cpu = own.ru_utime + own.ru_stime + child.ru_utime + child.ru_stime
+print(f'Final CPU seconds: {cpu:.6f}', file=sys.stderr)
+sys.exit(result.returncode)
+"""
         command = [
             "docker", "run", "--rm", "--platform", "linux/amd64", "--network", "none",
             "--cpus", "2", "--memory", "4096m", "--memory-swap", "4096m", "--pids-limit", "256",
@@ -52,7 +72,7 @@ def main():
             "--security-opt", "no-new-privileges", "--user", "65534:65534", "--env", "HOME=/tmp",
             "--mount", f"type=bind,source={sample / 'commits'},target=/data/commits,readonly",
             "--mount", f"type=bind,source={sample / 'tests.json'},target=/data/tests.json,readonly",
-            args.image,
+            '--entrypoint', 'python', args.image, '-c', container_runner,
         ]
     else:
         command = [sys.executable, str(root / "selector.py"), "--data", str(sample),
@@ -71,17 +91,24 @@ def main():
             evaluation = evaluate_run(result.stdout, tests, answers)
             if not evaluation["ok"] or len(result.stdout) > 2_000_000:
                 raise SystemExit(f"{mode} rejected: {evaluation}")
-            match = re.search(rb"CPU seconds: ([\d.]+)", result.stderr)
+            match = re.search(rb"Final CPU seconds: ([\d.]+)", result.stderr)
+            if match is None:
+                match = re.search(rb"CPU seconds: ([\d.]+)", result.stderr)
             cpu = float(match[1]) if match else None
             estimate = re.search(rb"CPU estimate(?: \(partial\))?: ([\d.]+)", result.stderr)
             simulated = evaluation["simulated_milliseconds"]
             diagnostics = re.search(rb"^Probe CPU seconds:.*$", result.stderr, re.MULTILINE)
             if diagnostics:
                 print(diagnostics[0].decode(), flush=True)
-            print(f"{mode} run {run}: simulated={simulated / 1000:.3f}s "
-                  f"wall={wall:.3f}s CPU={cpu} "
-                  f"{estimate[0].decode() + 's ' if estimate else ''}"
-                  f"misses={evaluation['missed_commits']}", flush=True)
+            report = (f"{mode} run {run}: simulated={simulated / 1000:.3f}s "
+                      f"wall={wall:.3f}s CPU={cpu} "
+                      f"{estimate[0].decode() + 's ' if estimate else ''}"
+                      f"misses={evaluation['missed_commits']}")
+            print(report, flush=True)
+            if os.environ.get('GITHUB_ACTIONS') == 'true':
+                print(f'::notice title=Sample benchmark::{report}', flush=True)
+            if evaluation['missed_commits']:
+                raise SystemExit(f'{mode} missed failing tests')
             if cpu is not None:
                 totals.append(run_total_microseconds(simulated, round(cpu * 1_000_000)))
             elif estimate and b"partial" not in estimate[0]:
@@ -91,6 +118,15 @@ def main():
             median = int(statistics.median(totals))
             print(f"{mode} median total: {median / 1_000_000:.6f}s "
                   f"(rounded {(median + 50_000) // 100_000 / 10:.1f}s)", flush=True)
+            if args.image and mode == 'verified':
+                score = (Decimal(median) / Decimal(1_000_000)).quantize(
+                    Decimal('0.1'), rounding=ROUND_HALF_UP)
+                if score >= args.target_seconds:
+                    message = f'Total {score}s exceeds the target below {args.target_seconds}s'
+                    if os.environ.get('GITHUB_ACTIONS') == 'true':
+                        print(f'::error title=Score target missed::{message}', flush=True)
+                    raise SystemExit(message)
+                print(f'Target passed: {score}s below {args.target_seconds}s', flush=True)
         elif len(estimates) == args.runs:
             median = statistics.median(estimates)
             print(f"{mode} median estimated total: {median / 1_000_000:.6f}s", flush=True)

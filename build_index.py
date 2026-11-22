@@ -12,9 +12,11 @@ import sys
 def build(root, output):
     import coverage
     import pytest
+    import build_trace
     from inline_pool import install
 
     install()
+    build_trace.install(root)
 
     os.chdir(root)
     sys.path.insert(0, str(root))
@@ -50,11 +52,13 @@ def build(root, output):
         def pytest_runtest_protocol(self, item):
             nonlocal active
             active = item.nodeid
+            build_trace.context = active
             tracer.switch_context(active)
             try:
                 return (yield)
             finally:
                 active = ""
+                build_trace.context = active
                 tracer.switch_context("")
 
         @pytest.hookimpl(wrapper=True)
@@ -64,11 +68,13 @@ def build(root, output):
                 return (yield)
             previous = active
             active = "fixture:" + request.node.nodeid
+            build_trace.context = active
             tracer.switch_context(active)
             try:
                 return (yield)
             finally:
                 active = previous
+                build_trace.context = active
                 tracer.switch_context(active)
 
     plugin = Collector()
@@ -80,7 +86,7 @@ def build(root, output):
     finally:
         tracer.stop()
     if result != 0:
-        print(f"Baseline pytest exit {result}; see test log", file=sys.stderr)
+        raise RuntimeError(f"Baseline pytest exit {result}; see test log")
     if not getattr(plugin, "ids", None):
         raise RuntimeError("No baseline tests collected")
 
@@ -108,8 +114,12 @@ def build(root, output):
         files[path] = {str(line): intern(contexts) for line, contexts in sorted(lines.items())}
     fixtures = {name: intern(contexts) if "" not in contexts else None
                 for name, contexts in sorted(reads.items())}
+    config_reads = {}
+    for (path, name, key), contexts in sorted(build_trace.reads.items()):
+        config_reads.setdefault(path, {}).setdefault(name, {})[key] = (
+            None if '' in contexts else intern(contexts))
     index = {"ids": ids, "files": files, "fixtures": fixtures,
-             "masks": [format(mask, "x") for mask in masks]}
+             "masks": [format(mask, "x") for mask in masks], 'config_reads': config_reads}
     add_static_analysis(root, index)
     with output.open("wb") as raw:
         with gzip.GzipFile(fileobj=raw, mode="wb", mtime=0, filename="") as compressed:

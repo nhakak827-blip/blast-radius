@@ -184,6 +184,7 @@ class Impact:
         self.symbols = {}
         self.static_symbols = index.get("references")
         self.comparison_proofs = index.get("comparison_proofs")
+        self.config_reads = index.get('config_reads')
 
     def union(self, mask_ids):
         mask = 0
@@ -249,6 +250,9 @@ class Impact:
             except (ValueError, TypeError):
                 return None
             if all(type(offset) is int for offset in offsets):
+                if self.config_reads is not None:
+                    mask_id = self.config_reads.get(path, {}).get(name, {}).get('', 0)
+                    return self.all if mask_id is None else self.masks[mask_id]
                 return self.references(name)
         if (path.startswith("sqlglot/dialects/") and name == "NUMERIC_ESCAPES"
                 and klass.name == "Tokenizer"):
@@ -262,6 +266,16 @@ class Impact:
                        and all(type(number) is int for number in value)
                        for value in (*old.values(), *new.values())):
                 return None
+            if self.config_reads is not None:
+                readers = self.config_reads.get(path, {}).get(name, {})
+                mask = 0
+                for key in old:
+                    if old[key] != new[key]:
+                        mask_id = readers.get(str(key), 0)
+                        if mask_id is None:
+                            return self.all
+                        mask |= self.masks[mask_id]
+                return mask
             # Generator consumers test only key membership or dict truthiness. Tokenizer
             # consumers of the values enter one of the two numeric escape readers.
             engine = "sqlglot/tokenizer_core.py"
@@ -467,7 +481,8 @@ def main():
         if (not args.coverage_only and sources and probeable
                 and probe_ms <= args.probe_budget_ms):
             request_index = len(requests)
-            requests.append({"ids": [test["id"] for test in probeable], "sources": sources})
+            ordered = sorted(probeable, key=lambda test: (durations[test['number']], test['number']))
+            requests.append({"ids": [test["id"] for test in ordered], "sources": sources})
         rows.append((patch.stem, selected, request_index))
     results, cpu = probe_batch(args.checkout, requests, args.report_cpu) if requests else ([], 0.0)
     for commit, selected, request_index in rows:

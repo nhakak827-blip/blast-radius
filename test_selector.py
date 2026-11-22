@@ -1,10 +1,14 @@
 """Synthetic regression checks for patch interpretation and selection."""
 import importlib.util
+import ast
 from pathlib import Path
 import tempfile
 import unittest
+import sys
+import types
 
 from selector import Impact, apply_hunks, optimized_workers, parse_patch, probe, probe_batch
+from probe import patch_loaded_functions
 
 
 class PatchTests(unittest.TestCase):
@@ -113,6 +117,38 @@ class ImpactTests(unittest.TestCase):
                                        "-        return self.value is None\n"
                                        "+        return self.value == None\n"), [0, 2])
 
+    def test_configuration_reads_preserve_the_observed_readers(self):
+        path = 'sqlglot/dialects/example.py'
+        self.impact.config_reads = {path: {'WEEK_OFFSET': {'': 2}, 'NUMERIC_ESCAPES': {'x': 1}}}
+        klass = ast.parse('class Tokenizer: pass').body[0]
+        before = ast.parse('WEEK_OFFSET = -1').body[0]
+        after = ast.parse('WEEK_OFFSET = -2').body[0]
+        self.assertEqual(self.impact.class_data(path, klass, before, after), 2)
+        before = ast.parse("NUMERIC_ESCAPES = {'x': (16, 2, 2, 255), 'u': (16, 4, 4, 65535)}").body[0]
+        after = ast.parse("NUMERIC_ESCAPES = {'x': (16, 2, 2, 255), 'u': (17, 4, 4, 65535)}").body[0]
+        self.assertEqual(self.impact.class_data(path, klass, before, after), 0)
+        self.impact.config_reads[path]['NUMERIC_ESCAPES']['u'] = 1
+        self.assertEqual(self.impact.class_data(path, klass, before, after), 1)
+
+
+class LoadedFunctionTests(unittest.TestCase):
+    def test_aliases_observe_body_changes_and_signature_changes_fall_back(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            source = 'def value():\n    return 1\n'
+            (root / 'hot_patch_fixture.py').write_text(source, encoding='utf-8')
+            module = types.ModuleType('hot_patch_fixture')
+            exec(compile(source, str(root / 'hot_patch_fixture.py'), 'exec'), module.__dict__)
+            sys.modules[module.__name__] = module
+            self.addCleanup(sys.modules.pop, module.__name__, None)
+            alias = module.value
+            self.assertTrue(patch_loaded_functions(root, {'hot_patch_fixture.py':
+                'def value():\n    return 2\n'}))
+            self.assertEqual(alias(), 2)
+            self.assertFalse(patch_loaded_functions(root, {'hot_patch_fixture.py':
+                'def value(argument=3):\n    return argument\n'}))
+            self.assertEqual(alias(), 2)
+
 
 class SchedulerTests(unittest.TestCase):
     def test_worker_count_adapts(self):
@@ -146,11 +182,12 @@ class ProbeTests(unittest.TestCase):
             self.assertEqual(passed, {"test_example.py::Cases::test_passes"})
             if all(importlib.util.find_spec(name) for name in ("numpy", "pandas", "duckdb")):
                 results, _ = probe_batch(root, [
-                    {"ids": [test["id"] for test in tests], "sources": {"example.py": "value = 2\n"}},
+                    {"ids": [test["id"] for test in reversed(tests)], "sources": {"example.py": "value = 2\n"}},
                     {"ids": [test["id"] for test in tests], "sources": {"example.py": "value = 1\n"}},
+                    {"ids": [test["id"] for test in tests], "sources": {"example.py": "value = 2\n"}},
                 ])
                 self.assertEqual(results, [{"test_example.py::Cases::test_passes"},
-                                           {"test_example.py::Cases::test_subtest"}])
+                                           {"test_example.py::Cases::test_subtest"}, set()])
 
 
 if __name__ == "__main__":

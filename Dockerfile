@@ -15,7 +15,7 @@ RUN python -m compileall -q /sqlglot
 
 FROM labeling AS index
 RUN pip install --no-cache-dir coverage==7.17.4
-COPY build_index.py inline_pool.py comparisons.py /build/
+COPY build_index.py inline_pool.py comparisons.py build_trace.py /build/
 RUN python /build/build_index.py /sqlglot /build/impact.json.gz \
     && chmod 644 /build/impact.json.gz
 
