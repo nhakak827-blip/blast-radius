@@ -56,7 +56,7 @@ The local benchmark validates the same output format and simulated score. Use th
 
 ### Sample results
 
-The 30-commit benchmark ran on Windows with Python 3.12 and the locked dependencies. Every selection produced valid scorer output with zero misses.
+The original 30-commit benchmark ran on Windows with Python 3.12 and the locked dependencies. Every selection produced valid scorer output with zero misses.
 
 | Mode | Simulated score | Median with estimated local CPU |
 | --- | ---: | ---: |
@@ -64,7 +64,9 @@ The 30-commit benchmark ran on Windows with Python 3.12 and the locked dependenc
 | Coverage only | 113.067 s | 113.364 s |
 | Coverage and verification | 94.351 s | 98.039 s |
 
-The verified mode matched the 94.351 s reference obtained by scheduling only the known sample failures. Local CPU estimates cover the selector and completed probes. The Docker build and Linux container score remain unverified.
+The verified mode matched the 94.351 s reference obtained by scheduling only the known sample failures. The subsequent GitHub Linux run also had zero misses and a 94.351 s simulated score, with 17.703459 s median CPU, for a total of 112.054459 s. That result exceeds the 101.9 s target.
+
+The current revision moves reusable symbol references and comparison proofs into the build index. Runtime probes share clean third-party imports through a parent process and execute each patch in an isolated child process. Linux uses fork, while Windows uses spawn. Local regression checks and benchmarks validate the selected tests. The revised Linux CPU score requires another GitHub benchmark.
 
 `make sample` prints your simulated seconds and misses, which are exact for that output. The board adds the CPU seconds your container used and takes the middle of 3 runs, so expect it a little higher. Your program never sees `sample/answers.json`: only the patches and `tests.json` are mounted.
 

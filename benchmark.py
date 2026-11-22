@@ -75,6 +75,9 @@ def main():
             cpu = float(match[1]) if match else None
             estimate = re.search(rb"CPU estimate(?: \(partial\))?: ([\d.]+)", result.stderr)
             simulated = evaluation["simulated_milliseconds"]
+            diagnostics = re.search(rb"^Probe CPU seconds:.*$", result.stderr, re.MULTILINE)
+            if diagnostics:
+                print(diagnostics[0].decode(), flush=True)
             print(f"{mode} run {run}: simulated={simulated / 1000:.3f}s "
                   f"wall={wall:.3f}s CPU={cpu} "
                   f"{estimate[0].decode() + 's ' if estimate else ''}"

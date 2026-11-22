@@ -1,6 +1,7 @@
 """Run a bounded pytest probe in a fresh child and keep inconclusive test IDs."""
 import importlib.machinery
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import sys
@@ -53,9 +54,74 @@ def run(checkout, request):
     return sorted(reports.completed - reports.failed)
 
 
+def batch_child(checkout, request, connection):
+    """Keep each patch's imports, globals and pytest state inside its own process."""
+    sys.stdout = sys.stderr
+    try:
+        passing = run(checkout, request)
+        connection.send({"passing": passing, "cpu_seconds": time.process_time()})
+    finally:
+        connection.close()
+
+
+def run_batch(checkout, requests):
+    # Forked probes share the expensive clean imports, while SQLGlot and the
+    # tests are first imported after forking and applying the individual patch.
+    import pytest
+    import pytest_timeout
+    import numpy
+    import pandas
+    import duckdb
+
+    context = multiprocessing.get_context("fork" if hasattr(os, "fork") else "spawn")
+    deadline = time.monotonic() + 70
+    results = []
+    timings = []
+    child_cpu = 0.0
+    complete = True
+    for request in requests:
+        remaining = deadline - time.monotonic()
+        if remaining < 2:
+            results.append([])
+            timings.append(None)
+            continue
+        receiver, sender = context.Pipe(duplex=False)
+        process = context.Process(target=batch_child, args=(checkout, request, sender))
+        try:
+            process.start()
+            sender.close()
+            if receiver.poll(min(15, remaining)):
+                result = receiver.recv()
+                results.append(result["passing"])
+                timings.append(result["cpu_seconds"])
+                child_cpu += result["cpu_seconds"]
+            else:
+                results.append([])
+                timings.append(None)
+                complete = False
+        except (EOFError, OSError):
+            results.append([])
+            timings.append(None)
+            complete = False
+        finally:
+            if process.pid is not None:
+                process.join(timeout=0.1)
+                if process.is_alive():
+                    process.terminate()
+                    process.join()
+            receiver.close()
+            sender.close()
+    return {"passing": results, "cpu_seconds": time.process_time() + child_cpu,
+            "complete": complete, "probe_seconds": timings}
+
+
 if __name__ == "__main__":
     request = json.load(sys.stdin)
     saved_stdout = sys.stdout
     sys.stdout = sys.stderr
-    passed = run(Path(sys.argv[1]), request)
-    print(json.dumps({"passing": passed, "cpu_seconds": time.process_time()}), file=saved_stdout)
+    if "--batch" in sys.argv[2:]:
+        result = run_batch(Path(sys.argv[1]), request)
+    else:
+        passed = run(Path(sys.argv[1]), request)
+        result = {"passing": passed, "cpu_seconds": time.process_time()}
+    print(json.dumps(result), file=saved_stdout)

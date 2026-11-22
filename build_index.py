@@ -1,5 +1,6 @@
 """Collect a dependency index from the clean SQLGlot checkout."""
 import argparse
+import ast
 import gzip
 import json
 import os
@@ -109,9 +110,43 @@ def build(root, output):
                 for name, contexts in sorted(reads.items())}
     index = {"ids": ids, "files": files, "fixtures": fixtures,
              "masks": [format(mask, "x") for mask in masks]}
+    add_static_analysis(root, index)
     with output.open("wb") as raw:
         with gzip.GzipFile(fileobj=raw, mode="wb", mtime=0, filename="") as compressed:
             compressed.write(json.dumps(index, separators=(",", ":")).encode())
+
+
+def add_static_analysis(root, index):
+    # Static references and type proofs depend only on the clean pinned checkout.
+    # Building them here avoids scanning the entire source tree for each runtime batch.
+    from comparisons import comparison_proofs
+    masks = [int(mask, 16) for mask in index["masks"]]
+    corpus = {}
+    for folder in ("sqlglot", "tests"):
+        for path in sorted((root / folder).rglob("*.py")):
+            source = path.read_text(encoding="utf-8")
+            corpus[path.relative_to(root).as_posix()] = source, ast.parse(source, type_comments=True)
+    references = defaultdict(int)
+    proofs = {}
+    for path, (_, tree) in corpus.items():
+        lines = index["files"].get(path, {})
+        for node in ast.walk(tree):
+            symbol = None
+            if isinstance(node, ast.Name):
+                symbol = node.id
+            elif isinstance(node, ast.Attribute):
+                symbol = node.attr
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.isidentifier():
+                symbol = node.value
+            if symbol is not None:
+                for line in range(node.lineno, node.end_lineno + 1):
+                    references[symbol] |= masks[lines.get(str(line), 0)]
+        if path.startswith("sqlglot/"):
+            proven = comparison_proofs(root, tree, corpus)
+            if proven:
+                proofs[path] = proven
+    index["references"] = {symbol: format(mask, "x") for symbol, mask in sorted(references.items())}
+    index["comparison_proofs"] = proofs
 
 
 if __name__ == "__main__":

@@ -13,7 +13,7 @@ import subprocess
 import sys
 import time
 
-from comparisons import equivalent_comparison
+from comparisons import equivalent_comparison, identical
 
 DATA = Path("/data")
 HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
@@ -141,10 +141,6 @@ def optimized_workers(numbers, durations):
     return best
 
 
-def identical(before, after):
-    return ast.dump(before) == ast.dump(after)
-
-
 def executable_changes(before, after):
     """Locate old statements that can observe body-only edits."""
     if identical(before, after):
@@ -186,6 +182,8 @@ class Impact:
             self.file_masks[path] = self.union(lines.values())
         self.sources = {}
         self.symbols = {}
+        self.static_symbols = index.get("references")
+        self.comparison_proofs = index.get("comparison_proofs")
 
     def union(self, mask_ids):
         mask = 0
@@ -219,6 +217,8 @@ class Impact:
 
     def references(self, symbol):
         """Join statically named references to the tests that executed them."""
+        if self.static_symbols is not None:
+            return int(self.static_symbols.get(symbol, "0"), 16)
         if symbol not in self.symbols:
             pattern = re.compile(r"\b" + re.escape(symbol) + r"\b")
             mask = 0
@@ -350,7 +350,8 @@ class Impact:
         # Compilation catches errors that ast.parse accepts, such as a top-level return.
         compile(changed, path, "exec", dont_inherit=True)
         new = ast.parse(changed, filename=path, type_comments=True)
-        if single_file and equivalent_comparison(self.checkout, old, new):
+        proven = None if self.comparison_proofs is None else self.comparison_proofs.get(path, [])
+        if single_file and equivalent_comparison(self.checkout, old, new, proven):
             return 0
         mask = self.changed_scope(path, old, new)
         if mask and path == "sqlglot/serde.py":
@@ -404,6 +405,27 @@ def probe(checkout, tests, sources, timeout):
         return set(), None
 
 
+def probe_batch(checkout, requests, diagnostics=False):
+    try:
+        result = subprocess.run(
+            [sys.executable, str(Path(__file__).with_name("probe.py")), str(checkout), "--batch"],
+            input=json.dumps(requests), encoding="utf-8", stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, timeout=80, check=True,
+        )
+        payload = json.loads(result.stdout)
+        passing = payload["passing"]
+        if (len(passing) != len(requests)
+                or any(not isinstance(items, list) or any(not isinstance(item, str) for item in items)
+                       for items in passing)):
+            raise ValueError("Invalid batch results")
+        cpu = float(payload["cpu_seconds"]) if payload["complete"] else None
+        if diagnostics:
+            print(f"Probe CPU seconds: {payload.get('probe_seconds', [])}", file=sys.stderr)
+        return [set(items) for items in passing], cpu
+    except (subprocess.SubprocessError, OSError, ValueError, TypeError, KeyError):
+        return [set() for _ in requests], None
+
+
 def report_cpu(probe_cpu, probes_complete):
     if os.environ.get("BLAST_RADIUS_CONTAINER") == "1":
         try:
@@ -436,25 +458,25 @@ def main():
     with gzip.open(args.index, "rt", encoding="utf-8") as stream:
         impact = Impact(json.load(stream), args.checkout, tests)
     durations = {test["number"]: math.floor(test["seconds"] * 1000 + 0.5) for test in tests}
-    deadline = time.monotonic() + 70
-    probe_cpu = 0.0
-    probes_complete = True
+    rows = []
+    requests = []
     for patch in sorted((args.data / "commits").glob("*.patch")):
         selected, sources, probeable = impact.select(patch)
         probe_ms = sum(durations[test["number"]] for test in probeable)
-        remaining = deadline - time.monotonic()
+        request_index = None
         if (not args.coverage_only and sources and probeable
-                and probe_ms <= args.probe_budget_ms and remaining >= 2):
-            passing, cpu = probe(args.checkout, probeable, sources, min(15, remaining))
-            if cpu is None:
-                probes_complete = False
-            else:
-                probe_cpu += cpu
-            selected = [test for test in selected if test["id"] not in passing]
+                and probe_ms <= args.probe_budget_ms):
+            request_index = len(requests)
+            requests.append({"ids": [test["id"] for test in probeable], "sources": sources})
+        rows.append((patch.stem, selected, request_index))
+    results, cpu = probe_batch(args.checkout, requests, args.report_cpu) if requests else ([], 0.0)
+    for commit, selected, request_index in rows:
+        if request_index is not None:
+            selected = [test for test in selected if test["id"] not in results[request_index]]
         workers = optimized_workers([test["number"] for test in selected], durations)
-        print(json.dumps({"commit": patch.stem, "workers": workers}, separators=(",", ":")))
+        print(json.dumps({"commit": commit, "workers": workers}, separators=(",", ":")))
     if args.report_cpu:
-        report_cpu(probe_cpu, probes_complete)
+        report_cpu(cpu or 0.0, cpu is not None)
 
 
 if __name__ == "__main__":

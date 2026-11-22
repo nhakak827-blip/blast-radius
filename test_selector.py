@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from selector import Impact, apply_hunks, optimized_workers, parse_patch, probe
+from selector import Impact, apply_hunks, optimized_workers, parse_patch, probe, probe_batch
 
 
 class PatchTests(unittest.TestCase):
@@ -144,6 +144,13 @@ class ProbeTests(unittest.TestCase):
                      for name in ("test_subtest", "test_passes")]
             passed, _ = probe(root, tests, {"example.py": "value = 2\n"}, 10)
             self.assertEqual(passed, {"test_example.py::Cases::test_passes"})
+            if all(importlib.util.find_spec(name) for name in ("numpy", "pandas", "duckdb")):
+                results, _ = probe_batch(root, [
+                    {"ids": [test["id"] for test in tests], "sources": {"example.py": "value = 2\n"}},
+                    {"ids": [test["id"] for test in tests], "sources": {"example.py": "value = 1\n"}},
+                ])
+                self.assertEqual(results, [{"test_example.py::Cases::test_passes"},
+                                           {"test_example.py::Cases::test_subtest"}])
 
 
 if __name__ == "__main__":

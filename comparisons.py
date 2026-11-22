@@ -3,6 +3,25 @@ import ast
 import re
 
 
+def identical(before, after):
+    """Compare AST structure without creating large intermediate dump strings."""
+    pending = [(before, after)]
+    while pending:
+        left, right = pending.pop()
+        if type(left) is not type(right):
+            return False
+        if isinstance(left, ast.AST):
+            pending.extend((getattr(left, name, None), getattr(right, name, None))
+                           for name in left._fields)
+        elif isinstance(left, list):
+            if len(left) != len(right):
+                return False
+            pending.extend(zip(left, right))
+        elif left != right:
+            return False
+    return True
+
+
 def expression(node):
     return ast.unparse(node)
 
@@ -28,20 +47,24 @@ def plain_class(tree, name):
 
 class ClosedWorldComparisons:
     """Use the declared concrete types of fields and in-repository enum assignments."""
-    def __init__(self, checkout, tree):
+    def __init__(self, checkout, tree, corpus=None):
         self.checkout = checkout
         self.tree = tree
         self.cache = {}
+        self.corpus = corpus
 
     def for_name(self, name):
         if name not in self.cache:
             pattern = re.compile(r"\b" + re.escape(name) + r"\b")
             trees = []
-            for folder in ("sqlglot", "tests"):
-                for path in (self.checkout / folder).rglob("*.py"):
-                    content = path.read_text(encoding="utf-8")
-                    if pattern.search(content):
-                        trees.append(ast.parse(content))
+            if self.corpus is not None:
+                trees = [tree for content, tree in self.corpus.values() if pattern.search(content)]
+            else:
+                for folder in ("sqlglot", "tests"):
+                    for path in (self.checkout / folder).rglob("*.py"):
+                        content = path.read_text(encoding="utf-8")
+                        if pattern.search(content):
+                            trees.append(ast.parse(content))
             self.cache[name] = trees
         return self.cache[name]
 
@@ -137,7 +160,7 @@ class ClosedWorldComparisons:
         return node
 
 
-def equivalent_comparison(checkout, old, new):
+def equivalent_comparison(checkout, old, new, proven=None):
     """Require that every AST difference vanish after an identity comparison proof."""
     old_nodes = list(ast.walk(old))
     new_nodes = list(ast.walk(new))
@@ -157,9 +180,35 @@ def equivalent_comparison(checkout, old, new):
     originals = [(node, node.ops.copy()) for pair in pairs for node in pair]
     try:
         for before, after in pairs:
-            checker.normalize(before)
-            checker.normalize(after)
-        return ast.dump(old) == ast.dump(new)
+            if proven is None:
+                checker.normalize(before)
+                checker.normalize(after)
+            else:
+                for node in (before, after):
+                    if ast.unparse(node) in proven:
+                        node.ops = [ast.Is() if isinstance(node.ops[0], (ast.Eq, ast.Is))
+                                    else ast.IsNot()]
+        return identical(old, new)
     finally:
         for node, ops in originals:
             node.ops = ops
+
+
+def comparison_proofs(checkout, tree, corpus):
+    """Record comparison equivalences derived exclusively from the pinned source."""
+    checker = ClosedWorldComparisons(checkout, tree, corpus)
+    proven = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Compare) and len(node.ops) == 1
+                and isinstance(node.ops[0], (ast.Is, ast.IsNot))
+                and isinstance(node.left, ast.Attribute)
+                and isinstance(node.left.value, ast.Name) and node.left.value.id == "self"):
+            continue
+        original_ops = node.ops
+        node.ops = [ast.Eq() if isinstance(original_ops[0], ast.Is) else ast.NotEq()]
+        equality = ast.unparse(node)
+        checker.normalize(node)
+        if isinstance(node.ops[0], (ast.Is, ast.IsNot)):
+            proven.extend((equality, ast.unparse(node)))
+        node.ops = original_ops
+    return proven
