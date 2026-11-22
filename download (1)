@@ -1,0 +1,8 @@
+.sqlglot/
+.deps/
+.venv/
+__pycache__/
+*.jsonl
+*.log
+*impact.json.gz
+/GitHub Upload/
